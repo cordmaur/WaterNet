@@ -71,6 +71,8 @@ def array2raster(filename, array, geo_transform, projection, nodatavalue=0, dtyp
     cols = array.shape[1]
     rows = array.shape[0]
 
+    print('Saving image: ' + filename)
+
     driver = gdal.GetDriverByName('GTiff')
     out_raster = driver.Create(filename, cols, rows, 1, dtype, options=['COMPRESS=PACKBITS'])
     out_raster.SetGeoTransform(geo_transform)
@@ -79,8 +81,18 @@ def array2raster(filename, array, geo_transform, projection, nodatavalue=0, dtyp
     outband.SetNoDataValue(nodatavalue)
     outband.WriteArray(array)
     outband.FlushCache()
-    print('Saving image: ' + filename)
     return
+
+
+def save_obj(path, obj):
+    with open(str(path), 'wb') as handle:
+        pickle.dump(obj, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_obj(path):
+    with open(str(path), 'rb') as handle:
+        obj = pickle.load(handle)
+    return obj
 
 
 ####################################################################################
@@ -91,7 +103,7 @@ class WNImage:
 
     def __init__(self, path=None, shape=None):
 
-        self.path, self.shape_ = path, shape
+        self.path_, self.shape_ = path, shape
 
         self.dataset = gdal.Open(str(path)) if path is not None else None
         self.loaded_bands_ = {}
@@ -117,7 +129,10 @@ class WNImage:
     @property
     def available_bands(self):
         # available bands is a combination of inner bands and calculated bands
-        return list(range(self.dataset.RasterCount)) + self.calc_bands
+        if self.dataset is not None:
+            return list(range(self.dataset.RasterCount)) + self.calc_bands
+        else:
+            return []
 
     @property
     def data_source(self):
@@ -139,7 +154,7 @@ class WNImage:
     @property
     def path(self):
         if self.dataset is not None:
-            return self.dataset.GetFileList()[0]
+            return Path(self.dataset.GetFileList()[0])
         else:
             return self.path_
 
@@ -243,6 +258,10 @@ class WNImage:
     def show(self, band):
         plt.imshow(self[band])
 
+    def save_bands(self, bands, name, no_value=0, dtype=gdal.GDT_Float32):
+        fn = self.path.with_name(name).with_suffix('.tif')
+        array2raster(str(fn), self[bands], self.geo_transform, self.projection, nodatavalue=no_value, dtype=dtype)
+
     def __del__(self):
         print(f'Cleaning memory from WNImage')
         self.clear()
@@ -251,10 +270,14 @@ class WNImage:
         return self.as_list(bands)
 
     def __repr__(self):
-        if self.dataset:
-            return f'WNImage obj with {len(self.available_bands)} bands'
-        else:
-            return f'Empty WNImage object'
+        s = f'WNImage with {len(self.available_bands)} available bands: {self.available_bands} \n'
+        s += f'Source: {self.path} \n'
+        # s += f'Bands {list(self.loaded_bands_.keys())} loaded in memory'
+        return s
+        # if self.dataset:
+        #     return f'WNImage obj with {len(self.available_bands)} bands'
+        # else:
+        #     return f'Empty WNImage object'
 
 
 ####################################################################################
@@ -328,9 +351,7 @@ class WNSatImage(WNImage):
             return None
         else:
             ds = gdal.Open(str(file))
-            if ds is not None:
-                print('Opening as dataset: ' + file.name)
-            else:
+            if ds is None:
                 print(f'Could not open file {file}')
 
             return ds
@@ -356,20 +377,25 @@ class WNSatImage(WNImage):
 
     def __repr__(self):
         s = f'WNSatImage with {self.available_bands} available bands \n'
-        s += f'Bands {self.loaded_bands_.keys()} loaded in memory'
+        s += f'Source: {self.path} \n'
+        s += f'Bands {list(self.loaded_bands_.keys())} loaded in memory'
         return s
 
 
 ####################################################################################
 class WNPatchProcessor:
-    def __init__(self, img=None):
+    def __init__(self, img=None, patches_path=None, from_patches=None):
 
-        # if (type(img) != WNSatImage) and (type(img) != WNImage):
-        #     print(f'Patch processor requires WNImage or derived class. Actual {type(img)}')
-        self.img = img
-        self.patches_ = []
-        self.path_patches_ = []
-        self.format_ = {}
+        self.patches_, self.path_patches_, self.format_ = [], [], {}
+
+        self.img = None
+
+        if img is not None:
+            self.img = img
+        elif patches_path is not None:
+            self.load_patches(patches_path)
+        elif from_patches is not None:
+            self.get_patches(from_patches)
 
         #todo: assembled img deve ser do tipo WNImage, para poder salvar e fazer o resto
 
@@ -422,12 +448,33 @@ class WNPatchProcessor:
             else:
                 return self[0].shape[-1]
 
-    def set_format(self, bands, size, shift, channels_first):
+    @property
+    def geo_transform(self):
+        if self.img is not None:
+            return self.img.geo_transform
+        else:
+            return self.format['geo_transform']
+
+    @property
+    def projection(self):
+        if self.img is not None:
+            return self.img.projection
+        else:
+            return self.format['projection']
+
+    def get_patches(self, patches):
+        self.clear()
+        self.patches_ = patches
+        self.path_patches_ = []
+
+    def set_format(self, bands, size, shift, channels_first, geo_transform=None, projection=None):
         format_ = {
             'bands': bands if type(bands) == list else [bands],
             'size': size,
             'shift': shift,
-            'channels_first': channels_first
+            'channels_first': channels_first,
+            'projection': projection,
+            'geo_transform': geo_transform
         }
         self.format_ = format_
 
@@ -507,7 +554,7 @@ class WNPatchProcessor:
             fn = path / f'{base_name}_{self.bands_string}_{i}.npy'
             np.save(str(fn), patch, allow_pickle=False)
 
-    def load_patches(self, path, bands, size, shift, base_name='', channels_first=True, in_memory=True):
+    def load_patches(self, path, bands=[], size=0, shift=0, base_name='', channels_first=True, in_memory=False):
         self.set_format(bands, size, shift, channels_first)
 
         imgs_names = [(int(str(file).split('_')[-1].split('.')[0]), str(file)) for file in path.iterdir()
@@ -522,7 +569,10 @@ class WNPatchProcessor:
 
         return None
 
-    def assembly_patches(self):
+    def assembly_patches(self, channels_first=None):
+        if channels_first is not None:
+            self.channels_first = channels_first
+
         if len(self) == 0:
             print(f'No patches to assembly')
             return
@@ -571,7 +621,7 @@ class WNPatchProcessor:
     def save_scene(self, path, dtype=gdal.GDT_Float32):
         scene = self.assembly_patches()
 
-        array2raster(str(path), scene, self.img.geo_transform, self.img.projection, nodatavalue=0, dtype=dtype)
+        array2raster(str(path), scene, self.geo_transform, self.projection, nodatavalue=0, dtype=dtype)
 
         return scene
 
@@ -606,8 +656,9 @@ class WNPatchProcessor:
             return None
 
     def __repr__(self):
-        return f'Patch Processors with {len(self)} patches and {len(self.patches_)} in memory patches \n' \
-               f'source img:{self.img is not None}'
+        s = f'Patch Processors with {len(self)} patches and {len(self.patches_)} in memory patches \n'
+        s += f'Source image:\n{str(self.img) if self.img is not None else "None"}'
+        return  s
 
     def __iter__(self):
         return iter(self.patches_)
@@ -617,87 +668,65 @@ class WNPatchProcessor:
 
 
 ####################################################################################
-class WNSegmentProcessor:
-    def __init__(self, img_path=None, lbl_path=None):
-        # Check if img_path is a satellite image or a single tif
-        if img_path and img_path.is_file():
-            print(f'File {img_path.name} is not yet supported')
-            return
-
-        img = WNSatImage(img_path) if img_path is not None else None
-        lbl = WNImage(lbl_path) if lbl_path is not None else None
-
-        self.img = WNPatchProcessor(img)
-        self.lbl = WNPatchProcessor(lbl)
-
-    @property
-    def format(self):
-        f = {'img': self.img.format}
-        f.update({'lbl': self.lbl.format})
-        return f
-
-    def generate_patches(self, out_path, bands, base_name, size, shift, channels_first=True):
-
-        self.img.create_patches(bands, size, shift, channels_first)
-        self.img.save_patches(out_path/'Images', base_name)
-
-        self.lbl.create_patches(0, size, shift, channels_first)
-        self.lbl.save_patches(out_path/'Labels', base_name)
-
-    def show_item(self, idx, bright=1., ax=None):
-        if ax is None:
-            fig, ax = plt.subplots(1, 2, figsize=(8, 4))
-
-        ax[0].set_title('Original')
-        self.img.show_item(idx, bright, ax[0])
-
-        if self.lbl is not None:
-            ax[1].set_title('Label')
-            self.lbl.show_item(idx, bright, ax[1])
-
-    def load_patches(self, path, bands, size, shift, base_name, channels_first, in_memory):
-        self.img.load_patches(path/'Images', bands, size, shift, base_name, channels_first, in_memory)
-        self.lbl.load_patches(path/'Labels', bands, size, shift, base_name, channels_first, in_memory)
-        assert len(self.img) == len(self.lbl)
-
-    def show_patches(self, idxs, bright=1.):
-        for idx in idxs:
-            self.show_item(idx, bright)
-
-    def set_data(self, imgs, lbls):
-        self.img = imgs
-        self.lbl = lbls
-
-    def __repr__(self):
-        s = f'Img: {self.img} \n'
-        s += f'Lbl: {self.lbl}'
-        return s
-
-    def __len__(self):
-        return len(self.img)
-
-
-####################################################################################
 class WNDataset(torch.utils.data.Dataset):
-    def __init__(self, path=None, bands=None, size=None, shift=None, base_name='',
-                 channels_first=True, in_memory=False, cuda=True, labels=True):
-
+    def __init__(self, imgs=None, lbls=None, cuda=True, path=None):
         super().__init__()
 
-        self.cuda, self.path, self.labels = cuda, path, labels
+        self.imgs, self.lbls = None, None
+        self.path_ = path
 
-        self.data = WNSegmentProcessor()
+        if path is None:
+            self.set_attr('imgs', imgs)
+            self.set_attr('lbls', lbls)
+        else:
+            self.imgs = WNPatchProcessor(patches_path=path/'Images')
+            self.lbls = WNPatchProcessor(patches_path=path/'Labels')
 
-        if path is not None:
-            self.data.load_patches(path, bands, size, shift, base_name, channels_first, in_memory)
+        self.cuda = cuda
 
         self.train_dl, self.valid_dl = None, None
 
-    def show_item(self, idx, bright=1., ax=None):
-        self.data.show_item(idx, bright, ax)
+    @property
+    def path(self):
+        return self.path_
 
-    def set_data(self, imgs, lbls=None):
-        self.data.set_data(imgs, lbls)
+    @property
+    def has_labels(self):
+        return self.lbls is not None
+
+    def show_item(self, idx, bright=1., ax=None, size=4):
+        columns = 2 if self.has_labels else 1
+        if ax is None:
+            fig, ax = plt.subplots(1, columns, figsize=(size*columns, size))
+
+        if type(ax) == np.ndarray:
+            ax = ax.reshape(-1)
+            ax[0].set_title('Image')
+            self.imgs.show_item(idx, bright=bright, ax=ax[0])
+            ax[1].set_title('Label')
+            self.lbls.show_item(idx, bright=bright, ax=ax[1])
+        else:
+            ax.set_title('Image')
+            self.imgs.show_item(idx, bright=bright, ax=ax)
+
+    def show_items(self, idxs, bright=1., size=4):
+        for idx in idxs:
+            self.show_item(idx, bright, size=size)
+
+    def set_attr(self, name, value):
+        if value is not None:
+            if isinstance(value, WNPatchProcessor) or True:
+                if len(value) == 0:
+                    print(f'Warning: Creating WNDataset with 0 elements in {name}')
+                setattr(self, name, value)
+            else:
+                print(f'Error: Object {name} is not a WNPatchProcessor: {type(value)} {__name__}')
+                setattr(self, name, None)
+        else:
+            setattr(self, name, None)
+
+    # def set_data(self, imgs, lbls=None):
+    #     self.data.set_data(imgs, lbls)
 
     def create_data_loaders(self, bs, shuffle=True, valid_size=0):
         train_ds, valid_ds = torch.utils.data.random_split(self, (len(self)-valid_size, valid_size))
@@ -705,16 +734,21 @@ class WNDataset(torch.utils.data.Dataset):
         self.valid_dl = torch.utils.data.DataLoader(valid_ds, batch_size=bs, shuffle=shuffle)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.imgs)
 
     def __getitem__(self, item):
-        x = (self.data.img[item] + 1) / 2
-        y = (self.data.lbl[item] + 1) / 2 if self.labels else 0
+        x = (self.imgs[item] + 1) / 2
+        y = (self.lbls[item] == 1).astype(int) if self.has_labels else 0
+        # y = (self.lbls[item] + 1) / 2 if self.has_labels else 0
 
         if self.cuda:
             return torch.tensor(x, dtype=torch.float32).cuda(), torch.tensor(y, dtype=torch.int64).cuda()
         else:
             return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.int64)
+
+    def __repr__(self):
+        s = f'WNDataset with {len(self)} items. Labels={self.has_labels}'
+        return s
 
 
 ####################################################################################
@@ -811,7 +845,7 @@ class WNLearner:
 
         with torch.no_grad():
             probs = self.model(x.unsqueeze(0)).squeeze().cpu()
-        return torch.argmax(probs, axis=0), probs
+        return torch.argmax(probs, axis=0).int(), probs
 
     def show_prediction(self, idx, bright=1.):
         # display input and original label
@@ -847,7 +881,9 @@ class WNLearner:
         torch.save(self.model.state_dict(), checkpoint_name)
 
     def load_checkpoint(self, checkpoint):
-        path = self.checkpoints[checkpoint] if type(checkpoint) == int else checkpoint
+        path = self.checkpoints[checkpoint] if type(checkpoint) == int else \
+            (self.models_path/checkpoint).with_suffix('.pth')
+        self.checkpoints.append(path)
         print(f'Loading weights at {path}')
         self.model.load_state_dict(torch.load(path))
 
@@ -858,20 +894,11 @@ class WNLearner:
 
         return preds
 
-
-
     def __repr__(self):
-        print(f'Learner with {len(self.checkpoints)} checkpoint.\n Last checkpoint at {self.checkpoints[-1]}')
-        return super().__repr__()
+        s = f'Learner with {len(self.checkpoints)} checkpoint.\n'
+        s += f'Last checkpoint at {self.checkpoints[-1] if len(self.checkpoints) > 0 else "None"}\n'
+        s += f'Object at: {super().__repr__()}'
+        return s
 
 
 
-def save_obj(path, obj):
-    with open(str(path), 'wb') as handle:
-        pickle.dump(obj, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def load_obj(path):
-    with open(str(path), 'rb') as handle:
-        obj = pickle.load(handle)
-    return obj
