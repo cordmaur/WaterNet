@@ -6,7 +6,7 @@ import torch
 from torch.utils import data
 import time
 import pickle
-
+from PIL import Image as PilImg
 
 import lightgbm as lgb
 # import pdb
@@ -95,6 +95,52 @@ def load_obj(path):
     return obj
 
 
+def rename_files(path, old_str, new_str):
+    [f.rename(f.with_name(f.name.replace(old_str, new_str))) for f in path.iterdir() if old_str in f.name]
+
+
+def normalize_band(img, band):
+    return (img[band] + 1) / 2
+
+
+def remove_negative(img, band):
+    b = img[band].copy()
+    b[b == -1.] = np.min(b[b != -1.])
+    if np.min(b) < 0:
+        b = b - np.min(b)
+    return b
+
+
+def create_training_patches(train_imgs, out_path, channels_first=True, ext='npy'):
+    for key, value in train_imgs.items():
+        # process the image
+        img = WNSatImage(value['img'])
+
+        img.band_math('n_ndwi', lambda x: normalize_band(x, 'ndwi'))
+        img.band_math('n_mndwi', lambda x: normalize_band(x, 'mndwi'))
+        img.band_math('n_B11', lambda x: remove_negative(img, 'B11'))
+
+        pproc = WNPatchProcessor(img)
+
+        pproc.create_patches(['n_mndwi', 'n_ndwi', 'n_B11', 'B2'], 366, 183, channels_first=channels_first)
+        pproc.save_patches(out_path / 'images', key, ext=ext)
+
+        # process the water mask (Label)
+        lbl = WNImage(value['lbl'])
+        lbl.band_math('water_mask', lambda x: np.where(x[0] == 255, 0, x[0]))
+
+        lproc = WNPatchProcessor(lbl)
+        lproc.create_patches('water_mask', 366, 183, channels_first=channels_first)
+        lproc.save_patches(out_path / 'labels', key, ext=ext)
+
+        lproc.clear()
+        pproc.clear()
+
+
+def create_custom_patches(path_img, bands, bands_math: dict=None, chnls_first=True, ext='npy'):
+    pass
+
+
 ####################################################################################
 class WNImage:
 
@@ -138,7 +184,7 @@ class WNImage:
     def data_source(self):
 
         if self.dataset is None:
-            print (f'No dataset in WNImage')
+            print(f'No dataset in WNImage')
             return None
         else:
             return self.dataset
@@ -255,12 +301,12 @@ class WNImage:
             self.loaded_bands_[band] = None
         self.loaded_bands_ = {}
 
-    def show(self, band):
-        plt.imshow(self[band])
+    def show(self, bands, bright=1.):
+        plt.imshow(self.as_cube(bands)*bright)
 
     def save_bands(self, bands, name, no_value=0, dtype=gdal.GDT_Float32):
         fn = self.path.with_name(name).with_suffix('.tif')
-        array2raster(str(fn), self[bands], self.geo_transform, self.projection, nodatavalue=no_value, dtype=dtype)
+        array2raster(str(fn), self.as_cube(bands), self.geo_transform, self.projection, nodatavalue=no_value, dtype=dtype)
 
     def __del__(self):
         print(f'Cleaning memory from WNImage')
@@ -308,9 +354,8 @@ class WNSatImage(WNImage):
 
     @property
     def data_source(self):
-
         if len(self.datasets) == 0:
-            print (f'No datasets in WNSatImage')
+            print(f'No datasets in WNSatImage')
             return None
         else:
             return list(self.datasets.values())[0]
@@ -393,7 +438,7 @@ class WNPatchProcessor:
         if img is not None:
             self.img = img
         elif patches_path is not None:
-            self.load_patches(patches_path)
+            self.load_patches(Path(patches_path))
         elif from_patches is not None:
             self.get_patches(from_patches)
 
@@ -545,14 +590,27 @@ class WNPatchProcessor:
         for p in range(qty):
             ax[p].imshow(self.get_visual_patch(p+first, bright))
 
-    def save_patches(self, path, base_name):
+    def save_patches(self, path, base_name, ext='npy'):
         if len(self) == 0:
             print(f'No patches to save')
             return
 
         for i, patch in enumerate(self.patches_):
-            fn = path / f'{base_name}_{self.bands_string}_{i}.npy'
-            np.save(str(fn), patch, allow_pickle=False)
+            fn = (path / f'{base_name}_{self.bands_string}_{i}').with_suffix('.'+ext)
+            patch = np.where(patch > 1, 1, np.where(patch < 0, 0, patch))
+
+            if ext == 'npy':
+                np.save(str(fn), patch, allow_pickle=False)
+
+            elif ext == 'jpg':
+                plt.imsave(fn.with_suffix('.png'), patch)
+
+            elif ext == 'png':
+                pil_img = PilImg.fromarray(patch)
+                pil_img.save(fn, 'PNG')
+            
+            elif ext == 'torch':
+                torch.save(patch, fn)
 
     def load_patches(self, path, bands=[], size=0, shift=0, base_name='', channels_first=True, in_memory=False):
         self.set_format(bands, size, shift, channels_first)
@@ -638,6 +696,17 @@ class WNPatchProcessor:
 
         self.patches_ = []
 
+    def patch_as_pil(self, idx):
+        patch = self[idx]
+        if self.channels_first:
+            # send the channels to last dimension
+            patch = np.transpose(patch, (1, 2, 0))
+
+        # use just 3 channels
+        pi = PilImg.fromarray((patch[:, :, :3] * 255).astype(np.uint8), mode='RGB')
+
+        return pi
+
     def __len__(self):
         length = len(self.patches_) if len(self.patches_) > 0 else len(self.path_patches_)
         return length
@@ -650,7 +719,11 @@ class WNPatchProcessor:
                 return self.patches_[item]
             # otherwise, load from disk
             else:
-                return np.load(self.path_patches_[item])
+                item_path = Path(self.path_patches_[item])
+                if item_path.suffix == '.npy':
+                    return np.load(self.path_patches_[item])
+                elif item_path.suffix == '.png':
+                    return plt.imread(self.path_patches_[item])
         else:
             print(f'Patch {item} not found')
             return None
@@ -820,7 +893,8 @@ class WNLearner:
 
                 # print('Epoch {}/{}'.format(epoch, epochs - 1))
                 print('-' * 10)
-                print('{} Loss: {:.4f} Acc: {}'.format(phase, epoch_loss, epoch_acc))
+                print('{} Loss: {:.4f} Acc: {}  Time{:.0f}m {:.0f}s'
+                      .format(phase, epoch_loss, epoch_acc, (time.time() - start) // 60, (time.time() - start) % 60))
                 print('-' * 10)
 
                 self.losses[phase_value].append(epoch_loss)
