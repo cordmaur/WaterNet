@@ -7,6 +7,7 @@ from torch.utils import data
 import time
 import pickle
 from PIL import Image as PilImg
+import WNFastaiClasses
 
 import lightgbm as lgb
 # import pdb
@@ -111,7 +112,7 @@ def remove_negative(img, band):
     return b
 
 
-def create_training_patches(train_imgs, out_path, channels_first=True, ext='npy'):
+def create_training_patches2(train_imgs, out_path, channels_first=True, ext='npy'):
     for key, value in train_imgs.items():
         # process the image
         img = WNSatImage(value['img'])
@@ -137,9 +138,100 @@ def create_training_patches(train_imgs, out_path, channels_first=True, ext='npy'
         pproc.clear()
 
 
-def create_custom_patches(path_img, bands, bands_math: dict=None, chnls_first=True, ext='npy'):
-    pass
+def create_custom_patches(img, bands, size, shift, bands_math={}, chnls_first=True):
+    # function
+    for key, value in bands_math.items():
+        img.band_math(key, value)
 
+    pproc = WNPatchProcessor(img)
+
+    pproc.create_patches(bands, size, shift, chnls_first)
+
+    return pproc
+
+
+def create_train_patches(img, lbl, out_path, size, shift, bands, bands_math={}, chnls_first=True, ext='npy',
+                         base_name='', proc_label={}):
+
+    out_path = Path(out_path)
+
+    for i in [img, lbl]:
+        if i is not None:
+            if type(i) == WNSatImage:
+                img_proc = create_custom_patches(i, bands, size, shift, bands_math, chnls_first=chnls_first)
+                path = out_path/'images'
+            else:
+                if len(proc_label) == 0:
+                    img_proc = create_custom_patches(i, 0, size, shift)
+                else:
+                    img_proc = create_custom_patches(i, list(proc_label.keys())[0], size, shift, bands_math=proc_label)
+
+                path = out_path/'labels'
+
+            path.mkdir(parents=True, exist_ok=True)
+            img_proc.save_patches(path, base_name, ext)
+            img_proc.clear()
+
+    return 'Processing completed'
+
+
+def auto_train_patches_creation(imgs_dict, out_path, bands, size, shift, bands_math={}, proc_label={},
+                                shape=(10980, 10980)):
+    for key, value in imgs_dict.items():
+        print(f'Creating patches for {key}')
+
+        if 'img' in value:
+            img = WNSatImage(value['img'])
+            img.shape = shape
+        else:
+            img = None
+
+        if 'lbl' in value:
+            lbl = WNImage(value['lbl'])
+            lbl.shape = shape
+        else:
+            lbl = None
+
+        create_train_patches(
+            img,
+            lbl,
+            out_path=out_path,
+            size=size,
+            shift=shift,
+            bands=bands,
+            bands_math=bands_math,
+            chnls_first=True,
+            base_name=key,
+            proc_label = proc_label
+        )
+
+
+def predict_patches(proc, learn):
+    lst_img = []
+    lst_mask = []
+
+    for idx in range(len(proc)):
+        ms_img = WNFastaiClasses.MSImage(torch.tensor(proc[idx]).float())
+        pred_img, mask, probs = learn.predict(ms_img)
+
+        # array = np.array(mask[0].data).squeeze()[:,:,np.newaxis]
+        array = np.array(mask[0].data).squeeze()
+
+        lst_img.append(pred_img)
+        lst_mask.append(mask.squeeze().numpy())
+        lst_probs.append(probs.numpy())
+
+    return lst_img, lst_mask, lst_probs
+
+
+def predict_image(img, learn, bands, size, shift, bands_math={}):
+    pproc = create_custom_patches(img, bands, size, shift, bands_math)
+
+    _, masks, _ = predict_patches(pproc, learn)
+    out_proc = WNPatchProcessor(from_patches=masks)
+    out_proc.set_format(0, 366, 366, True, img.geo_transform, img.projection)
+
+    return out_proc
 
 ####################################################################################
 class WNImage:
@@ -240,6 +332,7 @@ class WNImage:
             arr = ras.ReadAsArray(buf_xsize=self.shape[1],
                                   buf_ysize=self.shape[0],
                                   resample_alg=self.resampling)*factor
+            # astype('float32')
 
             # if not successful, it will raise an error
             if arr is None:
@@ -283,26 +376,34 @@ class WNImage:
     def as_list(self, bands=None):
         bands = self.available_bands if bands is None else bands
 
-        if type(bands) is not list:
-            return self.get_raster(bands)
-        else:
-            return [self.get_raster(band) for band in bands if self.get_raster(band) is not None]
+        bands = [bands] if type(bands) is not list else bands
+        return [self.get_raster(band) for band in bands if self.get_raster(band) is not None]
 
-    def as_cube(self, bands=None, channels_first=False):
+    def as_cube(self, bands=None, channels_first=False, squeeze=False):
         lst_bands = self.as_list(bands)
-        if len(lst_bands) > 0:
-            axis = 0 if channels_first else -1
-            return np.stack(lst_bands, axis=axis)
+        axis = 0 if channels_first else -1
+
+        if len(lst_bands) > 1:
+            cube = np.stack(lst_bands, axis=axis)
+
+        elif len(lst_bands) == 1:
+            cube = np.expand_dims(lst_bands[0], axis=axis)
+
         else:
             return None
+
+        return cube if not squeeze else cube.squeeze()
 
     def clear(self):
         for band in self.loaded_bands_.keys():
             self.loaded_bands_[band] = None
         self.loaded_bands_ = {}
 
-    def show(self, bands, bright=1.):
-        plt.imshow(self.as_cube(bands)*bright)
+    def show(self, bands, bright=1., ax=None):
+        if ax is None:
+            plt.imshow(self.as_cube(bands, squeeze=True)*bright)
+        else:
+            ax.imshow(self.as_cube(bands, squeeze=True)*bright)
 
     def save_bands(self, bands, name, no_value=0, dtype=gdal.GDT_Float32):
         fn = self.path.with_name(name).with_suffix('.tif')
@@ -313,7 +414,11 @@ class WNImage:
         self.clear()
 
     def __getitem__(self, bands):
-        return self.as_list(bands)
+        lst = self.as_list(bands)
+        if len(lst) == 1:
+            return lst[0]
+        else:
+            return lst
 
     def __repr__(self):
         s = f'WNImage with {len(self.available_bands)} available bands: {self.available_bands} \n'
@@ -338,6 +443,13 @@ class WNSatImage(WNImage):
                    'B11': 'SRE_B11.tif', 'B12': 'SRE_B12.tif',
                    }
 
+    dicS2_L2A = {'B1': '_B01_60m.jp2', 'B2': '_B02_10m.jp2', 'B3': '_B03_10m.jp2', 'B4': '_B04_10m.jp2',
+                 'B5': '_B05_20m.jp2', 'B6': '_B06_20m.jp2', 'B7': '_B07_20m.jp2', 'B8': '_B08_10m.jp2',
+                 'B8a': '_B8A_20m.jp2',
+                 'B9': '_B09_60m.jp2', 'B11': '_B11_20m.jp2', 'B12': '_B12_20m.jp2',
+                 }
+
+
     def __init__(self, path, img_dic=None, verbose=True, shape=None):
         super().__init__(None, shape)
 
@@ -358,7 +470,7 @@ class WNSatImage(WNImage):
             print(f'No datasets in WNSatImage')
             return None
         else:
-            return list(self.datasets.values())[0]
+            return list(self.datasets.values())[1]
 
     @property
     def projection(self):
@@ -560,8 +672,10 @@ class WNPatchProcessor:
         else:
             visual_patch = None
 
-        visual_patch = np.where(visual_patch < 0, 0, visual_patch) * bright
-        visual_patch = np.where(visual_patch > 1, 1, visual_patch)
+        if patch.dtype != 'uint8':
+            visual_patch = np.where(visual_patch < 0, 0, visual_patch) * bright
+            visual_patch = np.where(visual_patch > 1, 1, visual_patch)
+
         return visual_patch
 
     def show_item(self, idx, bright=1., ax=None):
@@ -597,7 +711,7 @@ class WNPatchProcessor:
 
         for i, patch in enumerate(self.patches_):
             fn = (path / f'{base_name}_{self.bands_string}_{i}').with_suffix('.'+ext)
-            patch = np.where(patch > 1, 1, np.where(patch < 0, 0, patch))
+            # patch = np.where(patch > 1, 1, np.where(patch < 0, 0, patch))
 
             if ext == 'npy':
                 np.save(str(fn), patch, allow_pickle=False)
