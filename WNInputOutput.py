@@ -112,7 +112,7 @@ def remove_negative(img, band):
     return b
 
 
-def create_training_patches2(train_imgs, out_path, channels_first=True, ext='npy'):
+def create_training_patches_old(train_imgs, out_path, channels_first=True, ext='npy'):
     for key, value in train_imgs.items():
         # process the image
         img = WNSatImage(value['img'])
@@ -145,31 +145,31 @@ def create_custom_patches(img, bands, size, shift, bands_math={}, chnls_first=Tr
 
     pproc = WNPatchProcessor(img)
 
-    pproc.create_patches(bands, size, shift, chnls_first)
+    pproc.create_patches(bands+list(bands_math.keys()), size, shift, chnls_first)
 
     return pproc
 
 
 def create_train_patches(img, lbl, out_path, size, shift, bands, bands_math={}, chnls_first=True, ext='npy',
-                         base_name='', proc_label={}):
+                         base_name='', proc_label={}, fill_nan=None):
 
     out_path = Path(out_path)
 
-    for i in [img, lbl]:
+    for i, path_name, maths in zip([img, lbl], ['images', 'labels'], [bands_math, proc_label]):
         if i is not None:
-            if type(i) == WNSatImage:
-                img_proc = create_custom_patches(i, bands, size, shift, bands_math, chnls_first=chnls_first)
-                path = out_path/'images'
-            else:
-                if len(proc_label) == 0:
-                    img_proc = create_custom_patches(i, 0, size, shift)
-                else:
-                    img_proc = create_custom_patches(i, list(proc_label.keys())[0], size, shift, bands_math=proc_label)
+            path = out_path / path_name
 
-                path = out_path/'labels'
+            bands = bands if path_name == 'images' else [0]
 
-            path.mkdir(parents=True, exist_ok=True)
-            img_proc.save_patches(path, base_name, ext)
+            img_proc = create_custom_patches(i, bands, size, shift, maths, chnls_first=chnls_first)
+
+            # else:
+            #     if len(proc_label) == 0:
+            #         img_proc = create_custom_patches(i, 0, size, shift)
+            #     else:
+            #         img_proc = create_custom_patches(i, list(proc_label.keys())[0], size, shift, bands_math=proc_label)
+
+            img_proc.save_patches(path, base_name, ext, fill_nan=fill_nan)
             img_proc.clear()
 
     return 'Processing completed'
@@ -202,7 +202,7 @@ def auto_train_patches_creation(imgs_dict, out_path, bands, size, shift, bands_m
             bands_math=bands_math,
             chnls_first=True,
             base_name=key,
-            proc_label = proc_label
+            proc_label=proc_label
         )
 
 
@@ -259,6 +259,13 @@ class WNImage:
             return ((self[b1]+min_cte) - (self[b2]+min_cte)) / ((self[b1]+min_cte) + (self[b2]+min_cte))
         else:
             return self.band_math(name, lambda x: self.normalized_difference(b1, b2, None))
+
+    @staticmethod
+    def create_nan_mask(img):
+        nan_mask = np.zeros(img.shape).astype('bool')
+        for band in img.available_bands:
+            nan_mask |= np.isnan(img[band])
+        return nan_mask.astype('float32')
 
     @property
     def calc_bands(self):
@@ -410,7 +417,7 @@ class WNImage:
         array2raster(str(fn), self.as_cube(bands), self.geo_transform, self.projection, nodatavalue=no_value, dtype=dtype)
 
     def __del__(self):
-        print(f'Cleaning memory from WNImage')
+        # print(f'Cleaning memory from WNImage')
         self.clear()
 
     def __getitem__(self, bands):
@@ -556,6 +563,17 @@ class WNPatchProcessor:
 
         #todo: assembled img deve ser do tipo WNImage, para poder salvar e fazer o resto
 
+    @classmethod
+    def create_from_patches(cls, patches, size, shift, patches_per_row=None, channels_first=None, projection=None,
+                            geo_transform=None):
+        # If channels_first is None, it signifies that there is only one channel and it is squeezed (must be created)
+
+        proc = cls(from_patches=patches)
+        proc.set_format(0, size, shift, channels_first, ppr=patches_per_row, projection=projection,
+                        geo_transform=geo_transform)
+
+        return proc
+
     @property
     def format(self):
         return self.format_
@@ -621,17 +639,26 @@ class WNPatchProcessor:
 
     def get_patches(self, patches):
         self.clear()
-        self.patches_ = patches
+
+        # if the patches are in form of array, listify the first axis
+        if isinstance(patches, np.ndarray):
+            self.patches_ = []
+            for i in range(patches.shape[0]):
+                self.patches_.append(patches[i])
+        else:
+            self.patches_ = patches
+
         self.path_patches_ = []
 
-    def set_format(self, bands, size, shift, channels_first, geo_transform=None, projection=None):
+    def set_format(self, bands, size, shift, channels_first, geo_transform=None, projection=None, ppr=None):
         format_ = {
             'bands': bands if type(bands) == list else [bands],
             'size': size,
             'shift': shift,
             'channels_first': channels_first,
             'projection': projection,
-            'geo_transform': geo_transform
+            'geo_transform': geo_transform,
+            'patches_per_row': ppr
         }
         self.format_ = format_
 
@@ -656,7 +683,7 @@ class WNPatchProcessor:
 
         # return self.patches_
 
-    def get_visual_patch(self, idx, bright=1.):
+    def get_visual_patch(self, idx, bright=1., chnls=[3, 2, 1]):
         patch = self[idx]
         if patch is not None:
             if patch.ndim == 2:
@@ -666,13 +693,13 @@ class WNPatchProcessor:
                 patch = np.transpose(patch, dims)
 
                 if patch.shape[2] >= 3:
-                    visual_patch = patch[:, :, :3]
+                    visual_patch = patch[:, :, chnls]
                 else:
                     visual_patch = patch[:, :, 0]
         else:
             visual_patch = None
 
-        if patch.dtype != 'uint8':
+        if patch.dtype != 'int32':
             visual_patch = np.where(visual_patch < 0, 0, visual_patch) * bright
             visual_patch = np.where(visual_patch > 1, 1, visual_patch)
 
@@ -686,7 +713,7 @@ class WNPatchProcessor:
             else:
                 ax.imshow(patch)
 
-    def show_patches(self, first=None, last=None, bright=1.):
+    def show_patches(self, first=None, last=None, bright=1., chnls=[3, 2, 1]):
         if len(self) <= 0:
             print(f'No patches to show')
             return
@@ -702,14 +729,20 @@ class WNPatchProcessor:
 
         ax = ax.reshape(-1)
         for p in range(qty):
-            ax[p].imshow(self.get_visual_patch(p+first, bright))
+            ax[p].imshow(self.get_visual_patch(p+first, bright, chnls=chnls))
 
-    def save_patches(self, path, base_name, ext='npy'):
+    def save_patches(self, path, base_name, ext='npy', fill_nan=None):
         if len(self) == 0:
             print(f'No patches to save')
             return
 
+        path.mkdir(parents=True, exist_ok=True)
+
         for i, patch in enumerate(self.patches_):
+
+            if fill_nan is not None:
+                patch = np.nan_to_num(patch, nan=fill_nan)
+
             fn = (path / f'{base_name}_{self.bands_string}_{i}').with_suffix('.'+ext)
             # patch = np.where(patch > 1, 1, np.where(patch < 0, 0, patch))
 
@@ -749,10 +782,14 @@ class WNPatchProcessor:
             print(f'No patches to assembly')
             return
 
-        patches_by_row = int(math.sqrt(len(self)))
+        if self.format['patches_per_row'] is None:
+            patches_by_row = int(math.sqrt(len(self)))
+        else:
+            patches_by_row = self.format['patches_per_row']
 
-        # size = int((patches_by_row-1) * 190 + patches[0].shape[0])
-        size_y = self.patch_height * patches_by_row
+        patches_by_column = int(len(self)/patches_by_row)
+
+        size_y = self.patch_height * patches_by_column
         size_x = self.patch_width * patches_by_row
 
         # create the scene array
@@ -807,6 +844,9 @@ class WNPatchProcessor:
     def clear(self):
         if self.img is not None:
             self.img.clear()
+
+        for patch in self.patches_:
+            patch = None
 
         self.patches_ = []
 
