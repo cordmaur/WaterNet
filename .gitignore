@@ -1,0 +1,10 @@
+__pycache__/
+.idea/
+.venv/
+.DS_Store
+input/
+output/
+dist/
+waterdetect.egg-info/
+build/
+nbs/
