@@ -13,7 +13,7 @@ import gc
 
 from .wnbaseimage import WNBaseImage
 
-from typeguard import typechecked
+# from typeguard import typechecked
 
 
 class WNStacImage(WNBaseImage):
@@ -22,7 +22,7 @@ class WNStacImage(WNBaseImage):
     It loads the bands on demand and perform other functions as bands math and tiling (using patchify)
     """
 
-    @typechecked
+    # @typechecked
     def __init__(self, stac_item: item.Item, shape: Tuple[int, int]):
         """
         Create an instance that represents one single Sentinel2 image, based on the corresponding stac item.
