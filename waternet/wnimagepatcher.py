@@ -147,6 +147,7 @@ class WNImagePatcher:
 
     def clear(self):
         self.img.clear()
+        self._patches = None
         gc.collect()
 
     def __len__(self):

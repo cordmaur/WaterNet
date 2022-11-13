@@ -171,4 +171,5 @@ class WNStacImage(WNBaseImage):
 
         for band in list(self.loaded_bands.keys()):
             del self.loaded_bands[band]
+        self.loaded_bands = {}
         gc.collect()
